@@ -32,6 +32,19 @@ def get_installation_token(installation_id: int) -> str:
     return resp.json()["token"]
 
 
+def get_installation_id(repo_full_name: str) -> int:
+    token = _generate_jwt()
+    resp = httpx.get(
+        f"{GITHUB_API_URL}/repos/{repo_full_name}/installation",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+        },
+    )
+    resp.raise_for_status()
+    return resp.json()["id"]
+
+
 def get_github_client(installation_id: int) -> Github:
     token = get_installation_token(installation_id)
     auth = Auth.Token(token)

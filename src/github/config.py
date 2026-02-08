@@ -14,7 +14,7 @@ class Settings:
         )
     )
     github_webhook_secret: str = field(
-        default_factory=lambda: os.environ["GITHUB_WEBHOOK_SECRET"]
+        default_factory=lambda: os.environ.get("GITHUB_WEBHOOK_SECRET", "")
     )
     claude_command: str = field(
         default_factory=lambda: os.environ.get("CLAUDE_COMMAND", "claude")
