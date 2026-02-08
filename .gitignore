@@ -19,3 +19,5 @@ venv/
 *.swo
 
 uv.lock
+.DS_Store
+tmp/

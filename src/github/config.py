@@ -24,6 +24,9 @@ class Settings:
             os.environ.get("CLONE_DIR", "/tmp/agent-fedor-repos")
         )
     )
+    dummy_mode: bool = field(
+        default_factory=lambda: os.environ.get("DUMMY_MODE", "").lower() in ("1", "true", "yes")
+    )
 
     @property
     def github_private_key(self) -> str:

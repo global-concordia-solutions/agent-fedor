@@ -11,6 +11,10 @@ logger = logging.getLogger(__name__)
 async def run_review(
     clone_url: str, head_ref: str, token: str
 ) -> str:
+    if settings.dummy_mode:
+        logger.info("Dummy mode enabled, skipping real review")
+        return "Ponnggg"
+
     settings.clone_dir.mkdir(parents=True, exist_ok=True)
     repo_dir = settings.clone_dir / head_ref.replace("/", "_")
     if repo_dir.exists():
