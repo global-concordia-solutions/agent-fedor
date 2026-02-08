@@ -25,7 +25,7 @@ After `just review` runs, the cloned code is available at {clone_dir}/<sha>. You
 Available commands:
 
   just comments {repo} {pr}            — show existing PR comments
-  just review {repo} {pr}              — clone the PR, run code review, and post it as a comment
+  just review {repo} {pr}              — clone the PR, run code review, return the result (does NOT post anything)
   just comment {repo} {pr} "<message>" — post a comment on the PR
   just approve {repo} {pr}             — approve the PR
 
@@ -33,14 +33,17 @@ Rules:
 - Comments from "gcs-fedor[bot]" are YOUR OWN previous comments — do not treat them as developer feedback.
 - Comments from anyone else are developer feedback — respect their decisions.
 - If the developer dismissed a concern as intentional or out-of-scope, do NOT repeat it.
+- You are autonomous — make decisions and act on them. NEVER ask for permission or confirmation.
 
 Your task:
 1. Run `just comments {repo} {pr}` to read existing comments and developer feedback.
 2. Decide what to do based on the trigger and context:
-   - If this is a new PR or new commits — run `just review {repo} {pr}`, then check the result.
-   - If this is a developer comment — read what they asked for and respond appropriately
-     (answer questions, re-review if asked, approve if they resolved issues, etc.)
-3. If the code looks good and no real issues remain — run `just approve {repo} {pr}`.
+   - If this is a new PR or new commits — run `just review {repo} {pr}` to get the code review.
+   - If this is a developer comment — read what they asked for and respond appropriately.
+3. Analyze the review output, cross-check it with developer feedback, and post your own summary
+   via `just comment` — short verdict: what's good, what real issues remain (if any), and your decision.
+4. If the code is ready — run `just approve {repo} {pr}` immediately.
+5. If there are real blocking issues — do NOT approve, your summary comment is enough.
 """
 
 
@@ -63,22 +66,23 @@ async def _handle_pr(repo_full_name: str, pr_number: int, trigger: str) -> None:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+
+        async def _stream():
+            assert proc.stdout
+            async for line in proc.stdout:
+                logger.info("[claude] %s", line.decode(errors="replace").rstrip())
+
+        await asyncio.wait_for(
+            asyncio.gather(_stream(), proc.wait()),
+            timeout=600,
+        )
 
         if proc.returncode != 0:
-            logger.error(
-                "Claude exited with %d for %s#%d: %s",
-                proc.returncode, repo_full_name, pr_number,
-                stderr.decode(errors="replace"),
-            )
+            logger.error("Claude exited with %d for %s#%d", proc.returncode, repo_full_name, pr_number)
         else:
-            logger.info(
-                "Review completed for %s#%d: %s",
-                repo_full_name, pr_number,
-                stdout.decode(errors="replace")[:200],
-            )
+            logger.info("Review completed for %s#%d", repo_full_name, pr_number)
     except asyncio.TimeoutError:
         logger.error("Claude timed out for %s#%d", repo_full_name, pr_number)
         proc.kill()

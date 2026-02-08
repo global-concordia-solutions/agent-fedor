@@ -34,8 +34,6 @@ def cmd_review(args: argparse.Namespace) -> None:
 
     review_text = asyncio.run(run_review(clone_url, head_sha, token))
     print(review_text)
-    pr.create_issue_comment(f"## Agent Fedor — Code Review\n\n{review_text}")
-    logger.info("Posted review for %s#%d", args.repo, args.pr)
 
 
 def cmd_comments(args: argparse.Namespace) -> None:
