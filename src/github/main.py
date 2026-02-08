@@ -3,7 +3,7 @@ import hashlib
 import hmac
 import logging
 
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 
 from .config import settings
 
@@ -92,11 +92,32 @@ async def _handle_pr(repo_full_name: str, pr_number: int, trigger: str) -> None:
 
 BOT_LOGIN = "gcs-fedor[bot]"
 
+# key: "owner/repo#123" → pending asyncio.Task
+_pending: dict[str, asyncio.Task] = {}
+
+
+def _schedule_pr(repo_full_name: str, pr_number: int, trigger: str) -> None:
+    """Debounce: cancel previous timer for this PR, start a new one."""
+    key = f"{repo_full_name}#{pr_number}"
+
+    old = _pending.pop(key, None)
+    if old and not old.done():
+        old.cancel()
+        logger.info("Debounce: reset timer for %s", key)
+
+    async def _delayed():
+        delay = settings.webhook_delay
+        logger.info("Waiting %ds before handling %s (%s)", delay, key, trigger)
+        await asyncio.sleep(delay)
+        _pending.pop(key, None)
+        await _handle_pr(repo_full_name, pr_number, trigger)
+
+    _pending[key] = asyncio.create_task(_delayed())
+
 
 @app.post("/webhook")
 async def webhook(
     request: Request,
-    background_tasks: BackgroundTasks,
     x_hub_signature_256: str = Header(...),
     x_github_event: str = Header(...),
 ) -> dict:
@@ -111,12 +132,7 @@ async def webhook(
         pr = data["pull_request"]
         trigger = "new PR" if action == "opened" else "new commits pushed"
 
-        background_tasks.add_task(
-            _handle_pr,
-            repo_full_name=repo["full_name"],
-            pr_number=pr["number"],
-            trigger=trigger,
-        )
+        _schedule_pr(repo["full_name"], pr["number"], trigger)
         return {"status": "ok", "pr": pr["number"]}
 
     if x_github_event == "issue_comment" and action == "created":
@@ -133,12 +149,7 @@ async def webhook(
             return {"status": "ignored", "reason": "own comment"}
 
         repo = data["repository"]
-        background_tasks.add_task(
-            _handle_pr,
-            repo_full_name=repo["full_name"],
-            pr_number=issue["number"],
-            trigger=f"comment from @{sender}",
-        )
+        _schedule_pr(repo["full_name"], issue["number"], f"comment from @{sender}")
         return {"status": "ok", "pr": issue["number"]}
 
     logger.info("Ignored event: %s/%s", x_github_event, action)
