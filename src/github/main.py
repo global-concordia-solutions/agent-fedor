@@ -11,7 +11,11 @@ from .config import settings
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Agent Fedor — PR Reviewer")
@@ -45,6 +49,7 @@ Rules:
 - NEVER ask for permission, confirmation, or present options like "Would you like me to...". There is NO human on the other end — you are running as a background service.
 - You MUST always post your results to the PR using the `just` commands. Printing text to stdout does nothing — nobody reads it. The ONLY way to communicate is through the PR.
 - Every run MUST end with either `just submit-review`, `just approve`, or `just comment` — never with plain text output.
+- CRITICAL: All `just` commands MUST be a SINGLE LINE. Never use literal newlines inside command arguments. Use \\n for line breaks in messages (e.g., `just comment repo 123 "Line one\\nLine two"`). Multi-line commands will be silently rejected.
 
 Your task:
 1. Run `just comments {repo} {pr}` and `just review-comments {repo} {pr}` to read existing comments, review threads, and developer feedback.
@@ -67,30 +72,50 @@ Your task:
 """
 
 
+def _extract_tool_result_text(content: object) -> str:
+    """Extract text from a tool_result content field (string or list of blocks)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            b.get("text", "") for b in content if isinstance(b, dict)
+        )
+    return str(content) if content else ""
+
+
 def _log_stream_event(event: dict, bash_commands: list[str]) -> None:
     """Parse and log a stream-json event from Claude CLI."""
     etype = event.get("type", "")
 
     if etype == "assistant":
-        content = event.get("message", {}).get("content", [])
-        if isinstance(content, list):
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                if block.get("type") == "tool_use":
-                    name = block.get("name", "?")
-                    inp = block.get("input", {})
-                    if name == "Bash" and isinstance(inp, dict):
-                        cmd = inp.get("command", "")
-                        if cmd:
-                            bash_commands.append(cmd)
-                            logger.info("[claude:bash] %s", cmd[:500])
-                    else:
-                        logger.info("[claude:tool] %s", name)
-                elif block.get("type") == "text":
-                    text = block.get("text", "").strip()
-                    if text:
-                        logger.info("[claude:text] %s", text[:300])
+        for block in event.get("message", {}).get("content", []):
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "tool_use":
+                name = block.get("name", "?")
+                inp = block.get("input", {})
+                if name == "Bash" and isinstance(inp, dict):
+                    cmd = inp.get("command", "")
+                    if cmd:
+                        bash_commands.append(cmd)
+                        logger.info("[bash] %s", cmd.replace("\n", "\\n")[:500])
+                else:
+                    logger.info("[tool] %s", name)
+            elif btype == "text":
+                text = block.get("text", "").strip()
+                if text:
+                    logger.info("[text] %s", text[:300])
+
+    elif etype == "user":
+        for block in event.get("message", {}).get("content", []):
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            text = _extract_tool_result_text(block.get("content", ""))
+            if block.get("is_error"):
+                logger.warning("[tool_error] %s", text[:500])
+            elif text:
+                logger.debug("[tool_ok] %s", text[:200])
 
     elif etype == "result":
         cost = event.get("total_cost_usd")
@@ -98,11 +123,13 @@ def _log_stream_event(event: dict, bash_commands: list[str]) -> None:
         duration = event.get("duration_ms")
         is_error = event.get("is_error", False)
         logger.info(
-            "[claude:done] cost=$%.4f turns=%s duration=%.1fs error=%s",
+            "[done] cost=$%.4f turns=%s duration=%.1fs error=%s",
             cost or 0, turns, (duration or 0) / 1000, is_error,
         )
         if is_error:
-            logger.error("[claude:error] %s", event.get("result", "")[:500])
+            logger.error("[error] %s", event.get("result", "")[:500])
+        for denial in event.get("permission_denials", []):
+            logger.warning("[denied] %s", denial)
 
 
 async def _handle_pr(repo_full_name: str, pr_number: int, trigger: str) -> None:
