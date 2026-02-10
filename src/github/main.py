@@ -1,11 +1,15 @@
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
+from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Request
 
 from .config import settings
+
+PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,27 +28,81 @@ After `just review` runs, the cloned code is available at {clone_dir}/<sha>. You
 
 Available commands:
 
-  just comments {repo} {pr}            — show existing PR comments
-  just review {repo} {pr}              — clone the PR, run code review, return the result (does NOT post anything)
-  just comment {repo} {pr} "<message>" — post a comment on the PR
-  just approve {repo} {pr}             — approve the PR
+  just comments {repo} {pr}                                            — show existing PR issue comments
+  just review-comments {repo} {pr}                                     — show review threads (inline code comments) with status, paths, and comment IDs
+  just review {repo} {pr}                                              — clone the PR, run code review, return the result (does NOT post anything)
+  just comment {repo} {pr} "<message>"                                 — post an issue comment on the PR
+  just reply-comment {repo} {pr} <comment_id> "<message>"              — reply to a specific review thread (use comment IDs from `review-comments`)
+  just submit-review {repo} {pr} <EVENT> '<json>'                      — submit a review with inline comments; EVENT is COMMENT or REQUEST_CHANGES
+                                                                         json format: {{"body":"summary","comments":[{{"path":"file.py","line":10,"body":"issue"}}]}}
+  just approve {repo} {pr} "<message>"                                 — approve the PR (auto-resolves all review threads first)
 
 Rules:
 - Comments from "gcs-fedor[bot]" are YOUR OWN previous comments — do not treat them as developer feedback.
 - Comments from anyone else are developer feedback — respect their decisions.
 - If the developer dismissed a concern as intentional or out-of-scope, do NOT repeat it.
-- You are autonomous — make decisions and act on them. NEVER ask for permission or confirmation.
+- You are FULLY autonomous — make decisions and act on them immediately.
+- NEVER ask for permission, confirmation, or present options like "Would you like me to...". There is NO human on the other end — you are running as a background service.
+- You MUST always post your results to the PR using the `just` commands. Printing text to stdout does nothing — nobody reads it. The ONLY way to communicate is through the PR.
+- Every run MUST end with either `just submit-review`, `just approve`, or `just comment` — never with plain text output.
 
 Your task:
-1. Run `just comments {repo} {pr}` to read existing comments and developer feedback.
+1. Run `just comments {repo} {pr}` and `just review-comments {repo} {pr}` to read existing comments, review threads, and developer feedback.
 2. Decide what to do based on the trigger and context:
-   - If this is a new PR or new commits — run `just review {repo} {pr}` to get the code review.
-   - If this is a developer comment — read what they asked for and respond appropriately.
-3. Analyze the review output, cross-check it with developer feedback, and post your own summary
-   via `just comment` — short verdict: what's good, what real issues remain (if any), and your decision.
-4. If the code is ready — run `just approve {repo} {pr}` immediately.
-5. If there are real blocking issues — do NOT approve, your summary comment is enough.
+   - If this is a new PR or new commits:
+     a. Run `just review {repo} {pr}` to get the code review.
+     b. If there are issues, submit a review with inline comments:
+        `just submit-review {repo} {pr} COMMENT '<json>'`
+        or `just submit-review {repo} {pr} REQUEST_CHANGES '<json>'` for blocking issues.
+     c. If the code is clean, approve with a summary message:
+        `just approve {repo} {pr} "LGTM — summary of what looks good"`
+   - If this is a developer comment in a review thread:
+     a. Read the thread context via `just review-comments {repo} {pr}`.
+     b. Reply directly in the thread using `just reply-comment {repo} {pr} <comment_id> "<response>"`.
+     c. If all concerns are addressed, approve with `just approve {repo} {pr} "All concerns resolved"`.
+   - If this is a developer issue comment — read what they asked for and respond appropriately.
+3. Prefer inline review comments (`submit-review`) over issue comments (`comment`) for code-specific feedback.
+4. If the code is ready — run `just approve {repo} {pr} "<summary>"` immediately. This resolves all open threads.
+5. If there are real blocking issues — do NOT approve; your review comments are enough.
 """
+
+
+def _log_stream_event(event: dict, bash_commands: list[str]) -> None:
+    """Parse and log a stream-json event from Claude CLI."""
+    etype = event.get("type", "")
+
+    if etype == "assistant":
+        content = event.get("message", {}).get("content", [])
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    name = block.get("name", "?")
+                    inp = block.get("input", {})
+                    if name == "Bash" and isinstance(inp, dict):
+                        cmd = inp.get("command", "")
+                        if cmd:
+                            bash_commands.append(cmd)
+                            logger.info("[claude:bash] %s", cmd[:500])
+                    else:
+                        logger.info("[claude:tool] %s", name)
+                elif block.get("type") == "text":
+                    text = block.get("text", "").strip()
+                    if text:
+                        logger.info("[claude:text] %s", text[:300])
+
+    elif etype == "result":
+        cost = event.get("total_cost_usd")
+        turns = event.get("num_turns")
+        duration = event.get("duration_ms")
+        is_error = event.get("is_error", False)
+        logger.info(
+            "[claude:done] cost=$%.4f turns=%s duration=%.1fs error=%s",
+            cost or 0, turns, (duration or 0) / 1000, is_error,
+        )
+        if is_error:
+            logger.error("[claude:error] %s", event.get("result", "")[:500])
 
 
 async def _handle_pr(repo_full_name: str, pr_number: int, trigger: str) -> None:
@@ -58,7 +116,8 @@ async def _handle_pr(repo_full_name: str, pr_number: int, trigger: str) -> None:
         cmd = [
             settings.claude_command,
             "-p", prompt,
-            "--output-format", "text",
+            "--output-format", "stream-json",
+            "--verbose",
             "--allowedTools", "Bash(just *)",
             "--allowedTools", f"Read({settings.clone_dir}/*)",
         ]
@@ -66,23 +125,43 @@ async def _handle_pr(repo_full_name: str, pr_number: int, trigger: str) -> None:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=PROJECT_DIR,
         )
 
-        async def _stream():
+        bash_commands: list[str] = []
+
+        async def _stream_stdout():
             assert proc.stdout
-            async for line in proc.stdout:
-                logger.info("[claude] %s", line.decode(errors="replace").rstrip())
+            async for raw in proc.stdout:
+                line = raw.decode(errors="replace").rstrip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.info("[claude] %s", line[:500])
+                    continue
+                _log_stream_event(event, bash_commands)
+
+        async def _stream_stderr():
+            assert proc.stderr
+            async for raw in proc.stderr:
+                line = raw.decode(errors="replace").rstrip()
+                if line:
+                    logger.warning("[claude:stderr] %s", line[:500])
 
         await asyncio.wait_for(
-            asyncio.gather(_stream(), proc.wait()),
+            asyncio.gather(_stream_stdout(), _stream_stderr(), proc.wait()),
             timeout=600,
         )
 
         if proc.returncode != 0:
-            logger.error("Claude exited with %d for %s#%d", proc.returncode, repo_full_name, pr_number)
+            logger.error("Claude exited with code %d for %s#%d", proc.returncode, repo_full_name, pr_number)
+        elif not bash_commands:
+            logger.warning("Claude ran no commands for %s#%d — review likely not posted", repo_full_name, pr_number)
         else:
-            logger.info("Review completed for %s#%d", repo_full_name, pr_number)
+            logger.info("Review completed for %s#%d — ran %d commands", repo_full_name, pr_number, len(bash_commands))
     except asyncio.TimeoutError:
         logger.error("Claude timed out for %s#%d", repo_full_name, pr_number)
         proc.kill()
@@ -91,6 +170,13 @@ async def _handle_pr(repo_full_name: str, pr_number: int, trigger: str) -> None:
 
 
 BOT_LOGIN = "gcs-fedor[bot]"
+
+
+def _has_required_label(labels: list[dict]) -> bool:
+    """Check if PR has the required label. If no label configured, allow all."""
+    if not settings.github_pr_label:
+        return True
+    return any(l["name"] == settings.github_pr_label for l in labels)
 
 # key: "owner/repo#123" → pending asyncio.Task
 _pending: dict[str, asyncio.Task] = {}
@@ -127,13 +213,38 @@ async def webhook(
     data = await request.json()
     action = data.get("action")
 
-    if x_github_event == "pull_request" and action in ("opened", "synchronize"):
+    if x_github_event == "pull_request" and action in ("opened", "synchronize", "labeled"):
         repo = data["repository"]
         pr = data["pull_request"]
-        trigger = "new PR" if action == "opened" else "new commits pushed"
+
+        if not _has_required_label(pr.get("labels", [])):
+            logger.info("Ignored PR #%d: missing required label %r", pr["number"], settings.github_pr_label)
+            return {"status": "ignored", "reason": "missing required label"}
+
+        if action == "opened":
+            trigger = "new PR"
+        elif action == "synchronize":
+            trigger = "new commits pushed"
+        else:
+            trigger = "label added"
 
         _schedule_pr(repo["full_name"], pr["number"], trigger)
         return {"status": "ok", "pr": pr["number"]}
+
+    if x_github_event == "pull_request_review_comment" and action == "created":
+        sender = data["comment"]["user"]["login"]
+        if sender == BOT_LOGIN:
+            logger.info("Ignored own review comment on PR")
+            return {"status": "ignored", "reason": "own review comment"}
+
+        if not _has_required_label(data["pull_request"].get("labels", [])):
+            logger.info("Ignored review comment: PR missing required label %r", settings.github_pr_label)
+            return {"status": "ignored", "reason": "missing required label"}
+
+        repo = data["repository"]
+        pr_number = data["pull_request"]["number"]
+        _schedule_pr(repo["full_name"], pr_number, f"review comment from @{sender}")
+        return {"status": "ok", "pr": pr_number}
 
     if x_github_event == "issue_comment" and action == "created":
         # Only handle comments on PRs (they have a pull_request key)
@@ -147,6 +258,10 @@ async def webhook(
         if sender == BOT_LOGIN:
             logger.info("Ignored own comment on #%d", issue["number"])
             return {"status": "ignored", "reason": "own comment"}
+
+        if not _has_required_label(issue.get("labels", [])):
+            logger.info("Ignored issue comment: PR #%d missing required label %r", issue["number"], settings.github_pr_label)
+            return {"status": "ignored", "reason": "missing required label"}
 
         repo = data["repository"]
         _schedule_pr(repo["full_name"], issue["number"], f"comment from @{sender}")

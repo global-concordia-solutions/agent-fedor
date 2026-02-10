@@ -30,6 +30,9 @@ class Settings:
     webhook_delay: int = field(
         default_factory=lambda: int(os.environ.get("WEBHOOK_DELAY", "300"))
     )
+    github_pr_label: str = field(
+        default_factory=lambda: os.environ.get("GITHUB_PR_LABEL", "fedor-review")
+    )
 
     @property
     def github_private_key(self) -> str:
