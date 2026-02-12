@@ -27,8 +27,8 @@ Repository: {repo}
 Pull Request: #{pr}
 Trigger: {trigger}
 
-Clone directory: {clone_dir}
-After `just review` runs, the cloned code is available at {clone_dir}/<sha>. You can read files there directly.
+Clone directory (absolute): {clone_dir}
+After `just review` runs, the cloned code is available at {clone_dir}/<first-12-chars-of-head-sha>/. Use the Read and Glob tools to inspect files there — do NOT use bash commands like `cd`, `ls`, `git`, `cat`, or `head` to read files.
 
 Available commands:
 
@@ -50,6 +50,7 @@ Rules:
 - You MUST always post your results to the PR using the `just` commands. Printing text to stdout does nothing — nobody reads it. The ONLY way to communicate is through the PR.
 - Every run MUST end with either `just submit-review`, `just approve`, or `just comment` — never with plain text output.
 - CRITICAL: All `just` commands MUST be a SINGLE LINE. Never use literal newlines inside command arguments. Use \\n for line breaks in messages (e.g., `just comment repo 123 "Line one\\nLine two"`). Multi-line commands will be silently rejected.
+- NEVER use bash for file operations — no `cd`, `ls`, `cat`, `head`, `git show`, `git diff`, or any other shell commands to read files. Use the Read tool (with absolute paths under {clone_dir}/) and Glob tool to inspect source code. The ONLY allowed bash usage is `just` commands.
 
 Your task:
 1. Run `just comments {repo} {pr}` and `just review-comments {repo} {pr}` to read existing comments, review threads, and developer feedback.
@@ -136,9 +137,10 @@ async def _handle_pr(repo_full_name: str, pr_number: int, trigger: str) -> None:
     try:
         logger.info("Handling %s for %s#%d", trigger, repo_full_name, pr_number)
 
+        clone_dir = settings.clone_dir.resolve()
         prompt = AGENT_PROMPT.format(
             repo=repo_full_name, pr=pr_number, trigger=trigger,
-            clone_dir=settings.clone_dir,
+            clone_dir=clone_dir,
         )
         cmd = [
             settings.claude_command,
@@ -146,7 +148,9 @@ async def _handle_pr(repo_full_name: str, pr_number: int, trigger: str) -> None:
             "--output-format", "stream-json",
             "--verbose",
             "--allowedTools", "Bash(just *)",
-            "--allowedTools", f"Read({settings.clone_dir}/*)",
+            "--allowedTools", f"Read({clone_dir}/*)",
+            "--allowedTools", f"Glob({clone_dir}/*)",
+            "--allowedTools", f"Grep({clone_dir}/*)",
         ]
 
         proc = await asyncio.create_subprocess_exec(
@@ -271,6 +275,28 @@ async def webhook(
         repo = data["repository"]
         pr_number = data["pull_request"]["number"]
         _schedule_pr(repo["full_name"], pr_number, f"review comment from @{sender}")
+        return {"status": "ok", "pr": pr_number}
+
+    if x_github_event == "pull_request_review" and action == "submitted":
+        review = data["review"]
+        sender = review["user"]["login"]
+        state = review.get("state", "")
+
+        if sender == BOT_LOGIN:
+            logger.info("Ignored own review on PR")
+            return {"status": "ignored", "reason": "own review"}
+
+        if state != "commented":
+            logger.info("Ignored review with state %r from @%s", state, sender)
+            return {"status": "ignored", "reason": f"review state: {state}"}
+
+        if not _has_required_label(data["pull_request"].get("labels", [])):
+            logger.info("Ignored review: PR missing required label %r", settings.github_pr_label)
+            return {"status": "ignored", "reason": "missing required label"}
+
+        repo = data["repository"]
+        pr_number = data["pull_request"]["number"]
+        _schedule_pr(repo["full_name"], pr_number, f"review (comment) from @{sender}")
         return {"status": "ok", "pr": pr_number}
 
     if x_github_event == "issue_comment" and action == "created":
